@@ -6,6 +6,12 @@ REMOTE_URL="https://github.com/davidemerlino03/bookfarmer.git"
 
 cd "$APP_DIR"
 
+if ! command -v adb >/dev/null 2>&1; then
+  echo "[bookfarmer] adb non e installato o non e presente nel PATH."
+  echo "[bookfarmer] Installa Android Platform Tools, poi riavvia questo script."
+  exit 1
+fi
+
 VERSION_PATTERN='^v?[0-9]+(\.[0-9]+)*$'
 VERSION_FILE=".current_release"
 
