@@ -2,6 +2,7 @@
 set -e
 
 APP_DIR="/Users/davide/Desktop/web-scrcpy-main"
+REMOTE_URL="https://github.com/davidemerlino03/bookfarmer.git"
 
 cd "$APP_DIR"
 
@@ -9,6 +10,14 @@ VERSION_PATTERN='^v?[0-9]+(\.[0-9]+)*$'
 VERSION_FILE=".current_release"
 
 echo "[bookfarmer] Controllo nuove release..."
+if ! git remote get-url origin >/dev/null 2>&1; then
+  echo "[bookfarmer] Configuro il repository remoto..."
+  git remote add origin "$REMOTE_URL"
+elif [ "$(git remote get-url origin)" != "$REMOTE_URL" ]; then
+  echo "[bookfarmer] Correggo il repository remoto..."
+  git remote set-url origin "$REMOTE_URL"
+fi
+
 git fetch origin --tags
 
 LATEST_TAG="$(
