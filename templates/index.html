@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="/static/css/font-awesome.min.css" rel="stylesheet">
+    <title>Bookfarmer</title>
+    <link href="/static/css/style.css" rel="stylesheet">
+    <script src="/static/js/socket.io.js"></script>
+    <script src="/static/select.js"></script>
+    <script src="/static/accounts.js"></script>
+    <script src="/static/js/input.js"></script>
+    <script src="/static/js/exp-golomb.js"></script>
+    <script src="/static/js/h264-sps-parser.js"></script>
+    <script src="/static/js/video_parser.js"></script>
+    <script src="/static/bookmindAPI.js"></script>
+    <script src="/static/js/inputControl.js"></script>
+</head>
+
+<body class="no-devices">
+    <header>
+        <h1>Bookfarmer</h1>
+        <label class="size-control">
+            Size
+            <input id="phone-size" type="range" min="90" max="320" step="10">
+            <span id="phone-size-value"></span>
+        </label>
+        <label class="stream-control">
+            Stream
+            <select id="stream-size">
+                <option value="360">360p</option>
+                <option value="480">480p</option>
+                <option value="720">720p</option>
+                <option value="1080">1080p</option>
+                <option value="1440">1440p</option>
+            </select>
+        </label>
+        <div id="summary">Connecting...</div>
+    </header>
+    <main id="devices"></main>
+    <div class="device-select-bar">
+        <select id="bookmaker-change-select">
+        </select>
+        <input id="script-name-input" class="script-name-input" type="text" placeholder="Nome script">
+    </div>
+    <div class="empty">No authorized Android devices connected</div>
+
+    <script src="/static/js/jmuxer.min.js"></script>
+    <script>
+
+
+        const devicesElement = document.getElementById('devices');
+        const summaryElement = document.getElementById('summary');
+        const phoneSizeInput = document.getElementById('phone-size');
+        const phoneSizeValue = document.getElementById('phone-size-value');
+        const streamSizeSelect = document.getElementById('stream-size');
+        const bookmakerChangeSelect = document.getElementById('bookmaker-change-select');
+        const scriptNameInput = document.getElementById('script-name-input');
+        const deviceViews = new Map();
+        let lastReplicatedTargetToggle = 0;
+        const savedPhoneSize = Math.max(90, Math.min(320, Number(localStorage.getItem('phoneCardWidth') || 170)));
+
+        populateBookmakerSelect(bookmakerChangeSelect, null);
+
+        function setPhoneCardWidth(width) {
+            document.documentElement.style.setProperty('--phone-card-width', `${width}px`);
+            phoneSizeInput.value = width;
+            phoneSizeValue.textContent = `${width}px`;
+            localStorage.setItem('phoneCardWidth', width);
+            deviceViews.forEach((view) => updateToolbarOverflow(view));
+        }
+
+        setPhoneCardWidth(savedPhoneSize);
+        phoneSizeInput.addEventListener('input', () => {
+            setPhoneCardWidth(phoneSizeInput.value);
+        });
+
+        function resetDeviceViewsForRestart() {
+
+            deviceViews.forEach((view) => {
+                console.log(`Resetting view for`);
+                console.log(view);
+                view.acceptVideo = false;
+                view.parserStats.init = 0;
+                view.parserStats.nalu = 0;
+                view.parserStats.size = '';
+                view.receivedBytes = 0;
+                view.statsElement.textContent = 'restarting';
+                view.status = 'starting';
+                view.statusElement.className = 'status starting';
+                if (view.jmuxer) {
+                    view.jmuxer.reset();
+                }
+                if (view.jmuxer) {
+                    view.parser = createVideoParser(view);
+                }
+            });
+        }
+
+        const socket = io({
+            reconnection: false,
+            autoConnect: true
+        });
+
+        const ACTION_SCRIPTS_STORAGE_KEY = 'bookfarmerActionScriptsBySerial';
+        const actionRecorder = {
+            currentEvents: [],
+            scriptsBySerial: loadActionScripts(),
+            selectedScriptNames: {},
+            recordingName: '',
+            recordingSerial: null,
+            recordingStartedAt: 0,
+            playing: false
+        };
+
+        function setSummary() {
+            const connected = [...deviceViews.values()].filter((view) => view.status === 'connected').length;
+            const total = deviceViews.size;
+            const selected = replicatedActionTargets.size();
+            const parts = [`${connected}/${total} connected`];
+            if (selected) {
+                parts.push(`${selected} multi`);
+            }
+            if (actionRecorder.recordingSerial) {
+                parts.push(`rec ${actionRecorder.recordingName || actionRecorder.currentEvents.length}`);
+            } else if (actionRecorder.currentEvents.length) {
+                parts.push(`draft ${actionRecorder.currentEvents.length}`);
+            } else {
+                const selectedScripts = Object.values(actionRecorder.selectedScriptNames).filter(Boolean).length;
+                if (selectedScripts) {
+                    parts.push(`${selectedScripts} script pronti`);
+                }
+            }
+            summaryElement.textContent = parts.join(' - ');
+            document.body.classList.toggle('no-devices', total === 0);
+        }
+
+        function cloneControlDataForTarget(data, targetView) {
+            if (!data || typeof data.slice !== 'function') {
+                return data;
+            }
+
+            const payload = data.slice(0);
+            const packet = new DataView(payload);
+            const type = packet.getUint8(0);
+            const targetWidth = targetView.input ? targetView.input.width : 0;
+            const targetHeight = targetView.input ? targetView.input.height : 0;
+
+            if (!targetWidth || !targetHeight) {
+                return payload;
+            }
+
+            if (type === 2 && payload.byteLength >= 24) {
+                const sourceX = packet.getInt32(10, false);
+                const sourceY = packet.getInt32(14, false);
+                const sourceWidth = packet.getUint16(18, false);
+                const sourceHeight = packet.getUint16(20, false);
+
+                if (sourceWidth && sourceHeight) {
+                    packet.setInt32(10, Math.round((sourceX / sourceWidth) * targetWidth), false);
+                    packet.setInt32(14, Math.round((sourceY / sourceHeight) * targetHeight), false);
+                    packet.setUint16(18, targetWidth, false);
+                    packet.setUint16(20, targetHeight, false);
+                }
+            } else if (type === 3 && payload.byteLength >= 19) {
+                const sourceX = packet.getInt32(1, false);
+                const sourceY = packet.getInt32(5, false);
+                const sourceWidth = packet.getUint16(9, false);
+                const sourceHeight = packet.getUint16(11, false);
+
+                if (sourceWidth && sourceHeight) {
+                    packet.setInt32(1, Math.round((sourceX / sourceWidth) * targetWidth), false);
+                    packet.setInt32(5, Math.round((sourceY / sourceHeight) * targetHeight), false);
+                    packet.setUint16(9, targetWidth, false);
+                    packet.setUint16(11, targetHeight, false);
+                }
+            }
+
+            return payload;
+        }
+
+        function stopToolbarEvent(event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+
+        function createButton(iconClass, title, onDown, onUp) {
+            const button = document.createElement('button');
+            button.className = 'icon';
+            button.type = 'button';
+            button.title = title;
+            button.innerHTML = `<i class="${iconClass}"></i>`;
+            button.addEventListener('pointerdown', (event) => {
+                stopToolbarEvent(event);
+                onDown(event);
+            });
+            button.addEventListener('pointerup', (event) => {
+                stopToolbarEvent(event);
+                onUp(event);
+            });
+            button.addEventListener('pointercancel', (event) => {
+                stopToolbarEvent(event);
+                onUp(event);
+            });
+            button.addEventListener('contextmenu', stopToolbarEvent);
+            return button;
+        }
+
+        function createMenuButton(view) {
+            const button = document.createElement('button');
+            button.className = 'icon';
+            button.type = 'button';
+            button.title = 'More';
+            button.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
+            button.addEventListener('pointerdown', (event) => {
+                stopToolbarEvent(event);
+                view.menuRoot.classList.toggle('open');
+            });
+            return button;
+        }
+
+        function updateToolbarOverflow(view) {
+            if (!view.toolbarActions || !view.menuPanel || !view.toolbarButtons) {
+                return;
+            }
+
+            view.menuRoot.style.display = 'none';
+            view.toolbarButtons.forEach((button) => view.toolbarActions.appendChild(button));
+
+            const toolbarWidth = view.toolbar.clientWidth;
+            const fixedWidth = view.statusElement.offsetWidth + view.statsElement.offsetWidth + 44;
+            const minTitleWidth = 34;
+            const menuWidth = 24;
+            const buttonWidth = 24;
+            const available = toolbarWidth - fixedWidth - minTitleWidth;
+            const visibleCount = Math.max(1, Math.min(
+                view.toolbarButtons.length,
+                Math.floor((available - menuWidth) / buttonWidth)
+            ));
+
+            const needsMenu = visibleCount < view.toolbarButtons.length;
+            view.toolbarButtons.forEach((button, index) => {
+                if (needsMenu && index >= visibleCount) {
+                    view.menuPanel.appendChild(button);
+                } else {
+                    view.toolbarActions.appendChild(button);
+                }
+            });
+
+            view.menuRoot.style.display = needsMenu ? 'block' : 'none';
+            if (!needsMenu) {
+                view.menuRoot.classList.remove('open');
+            }
+        }
+
+        function sendToolbarKey(view, event, action, keycode) {
+            stopToolbarEvent(event);
+            view.input.cancelTouch();
+            view.input.snedKeyCode(event, action, keycode);
+        }
+
+        function createRecorderButton(view, iconClass, title, onClick) {
+            return createButton(iconClass, title,
+                (event) => {
+                    stopToolbarEvent(event);
+                    view.input.cancelTouch();
+                    onClick(view);
+                },
+                stopToolbarEvent
+            );
+        }
+
+        function serializeControlData(data) {
+            if (!data) {
+                return [];
+            }
+
+            return [...new Uint8Array(data)];
+        }
+
+        function deserializeControlData(bytes) {
+            return new Uint8Array(bytes).buffer;
+        }
+
+        function serializeActionEvents(events) {
+            return events.map((event) => ({
+                delay: event.delay,
+                data: serializeControlData(event.data)
+            }));
+        }
+
+        function deserializeActionEvents(events) {
+            return events.map((event) => ({
+                delay: Number(event.delay) || 0,
+                data: deserializeControlData(event.data || [])
+            }));
+        }
+
+        function loadActionScripts() {
+            try {
+                const parsed = JSON.parse(localStorage.getItem(ACTION_SCRIPTS_STORAGE_KEY) || '{}');
+                return Object.fromEntries(Object.entries(parsed).map(([serial, scripts]) => ([
+                    serial,
+                    Object.fromEntries(Object.entries(scripts || {}).map(([name, script]) => ([
+                        name,
+                        {
+                            name,
+                            createdAt: script.createdAt || new Date().toISOString(),
+                            events: deserializeActionEvents(script.events || [])
+                        }
+                    ])))
+                ])));
+            } catch (error) {
+                console.error('Cannot load action scripts:', error);
+                return {};
+            }
+        }
+
+        function persistActionScripts() {
+            const payload = Object.fromEntries(Object.entries(actionRecorder.scriptsBySerial).map(([serial, scripts]) => ([
+                serial,
+                Object.fromEntries(Object.entries(scripts).map(([name, script]) => ([
+                    name,
+                    {
+                        name,
+                        createdAt: script.createdAt,
+                        events: serializeActionEvents(script.events)
+                    }
+                ])))
+            ])));
+            localStorage.setItem(ACTION_SCRIPTS_STORAGE_KEY, JSON.stringify(payload));
+        }
+
+        function actionScriptsForSerial(serial) {
+            if (!actionRecorder.scriptsBySerial[serial]) {
+                actionRecorder.scriptsBySerial[serial] = {};
+            }
+
+            return actionRecorder.scriptsBySerial[serial];
+        }
+
+        function selectedActionScript(serial) {
+            const name = actionRecorder.selectedScriptNames[serial] || '';
+            return actionScriptsForSerial(serial)[name] || null;
+        }
+
+        function updateScriptLibraryControls() {
+            deviceViews.forEach((view) => updateDeviceScriptControls(view));
+        }
+
+        function updateDeviceScriptControls(view) {
+            if (!view.actionScriptSelect || !view.actionScriptDeleteButton) {
+                return;
+            }
+
+            const scripts = actionScriptsForSerial(view.serial);
+            const names = Object.keys(scripts).sort((a, b) => a.localeCompare(b));
+            view.actionScriptSelect.innerHTML = '<option value="">Nessuno script</option>';
+            names.forEach((name) => {
+                const option = document.createElement('option');
+                option.value = name;
+                option.textContent = `${name} (${scripts[name].events.length})`;
+                view.actionScriptSelect.appendChild(option);
+            });
+
+            const selectedName = actionRecorder.selectedScriptNames[view.serial] || '';
+            if (selectedName && scripts[selectedName]) {
+                view.actionScriptSelect.value = selectedName;
+            } else {
+                actionRecorder.selectedScriptNames[view.serial] = '';
+                view.actionScriptSelect.value = '';
+            }
+
+            view.actionScriptDeleteButton.disabled = actionRecorder.recordingSerial || actionRecorder.playing || !view.actionScriptSelect.value;
+        }
+
+        function saveActionScript(serial, name, events) {
+            const cleanName = name.trim();
+            if (!cleanName || !events.length) {
+                return false;
+            }
+
+            const scripts = actionScriptsForSerial(serial);
+            scripts[cleanName] = {
+                name: cleanName,
+                createdAt: new Date().toISOString(),
+                events: events.map((event) => ({
+                    delay: event.delay,
+                    data: cloneControlData(event.data)
+                }))
+            };
+            actionRecorder.selectedScriptNames[serial] = cleanName;
+            scriptNameInput.value = cleanName;
+            persistActionScripts();
+            updateScriptLibraryControls();
+            updateRecorderButtons();
+            setSummary();
+            return true;
+        }
+
+        function deleteSelectedActionScriptForView(view) {
+            const selectedName = actionRecorder.selectedScriptNames[view.serial];
+            if (!selectedName || actionRecorder.recordingSerial || actionRecorder.playing) {
+                return;
+            }
+
+            delete actionScriptsForSerial(view.serial)[selectedName];
+            actionRecorder.selectedScriptNames[view.serial] = '';
+            persistActionScripts();
+            updateScriptLibraryControls();
+            updateRecorderButtons();
+            setSummary();
+        }
+
+        function cloneControlData(data) {
+            return data && typeof data.slice === 'function' ? data.slice(0) : data;
+        }
+
+        function recordAction(serial, data) {
+            if (!actionRecorder.recordingSerial || actionRecorder.playing) {
+                return;
+            }
+
+            if (serial !== actionRecorder.recordingSerial) {
+                return;
+            }
+
+            actionRecorder.currentEvents.push({
+                delay: Math.round(performance.now() - actionRecorder.recordingStartedAt),
+                data: cloneControlData(data)
+            });
+            updateScriptLibraryControls();
+            setSummary();
+        }
+
+        function updateRecorderButtons() {
+            deviceViews.forEach((view) => {
+                if (!view.recordButton || !view.stopRecordButton || !view.playRecordButton || !view.clearRecordButton) {
+                    return;
+                }
+
+                const isThisRecording = actionRecorder.recordingSerial === view.serial;
+                const isRecording = Boolean(actionRecorder.recordingSerial);
+                const hasScript = Boolean(selectedActionScript(view.serial));
+                const hasDraft = actionRecorder.currentEvents.length > 0;
+
+                view.recordButton.disabled = isRecording && !isThisRecording;
+                view.recordButton.classList.toggle('is-recording', isThisRecording);
+                view.stopRecordButton.disabled = !isThisRecording;
+                view.playRecordButton.disabled = isRecording || actionRecorder.playing || !hasScript || view.status !== 'connected';
+                view.clearRecordButton.disabled = isRecording || actionRecorder.playing || !hasDraft;
+            });
+        }
+
+        function startActionRecording(view) {
+            if (actionRecorder.recordingSerial && actionRecorder.recordingSerial !== view.serial) {
+                return;
+            }
+
+            const defaultName = scriptNameInput.value.trim() || `script-${new Date().toLocaleTimeString('it-IT').replaceAll(':', '-')}`;
+            const name = window.prompt('Nome registrazione', defaultName);
+            if (!name || !name.trim()) {
+                return;
+            }
+
+            actionRecorder.currentEvents = [];
+            actionRecorder.recordingName = name.trim();
+            actionRecorder.recordingSerial = view.serial;
+            actionRecorder.recordingStartedAt = performance.now();
+            scriptNameInput.value = actionRecorder.recordingName;
+            updateScriptLibraryControls();
+            updateRecorderButtons();
+            setSummary();
+        }
+
+        function stopActionRecording() {
+            const recordedSerial = actionRecorder.recordingSerial;
+            const recordedName = actionRecorder.recordingName;
+            const recordedEvents = actionRecorder.currentEvents.map((event) => ({
+                delay: event.delay,
+                data: cloneControlData(event.data)
+            }));
+
+            actionRecorder.recordingSerial = null;
+            actionRecorder.recordingName = '';
+            if (recordedSerial && recordedName && recordedEvents.length) {
+                saveActionScript(recordedSerial, recordedName, recordedEvents);
+            }
+            updateScriptLibraryControls();
+            updateRecorderButtons();
+            setSummary();
+        }
+
+        function clearActionRecording() {
+            if (actionRecorder.recordingSerial || actionRecorder.playing) {
+                return;
+            }
+
+            actionRecorder.currentEvents = [];
+            actionRecorder.recordingName = '';
+            updateScriptLibraryControls();
+            updateRecorderButtons();
+            setSummary();
+        }
+
+        function waitForActionDelay(delay) {
+            return new Promise((resolve) => window.setTimeout(resolve, Math.max(0, delay)));
+        }
+
+        async function playActionRecording(view) {
+            const script = selectedActionScript(view.serial);
+            if (actionRecorder.recordingSerial || actionRecorder.playing || !script) {
+                return;
+            }
+
+            actionRecorder.playing = true;
+            updateScriptLibraryControls();
+            updateRecorderButtons();
+            setSummary();
+
+            try {
+                let previousDelay = 0;
+                for (const event of script.events) {
+                    await waitForActionDelay(event.delay - previousDelay);
+                    previousDelay = event.delay;
+                    sendControl(view.serial, cloneControlData(event.data));
+                }
+            } finally {
+                actionRecorder.playing = false;
+                updateScriptLibraryControls();
+                updateRecorderButtons();
+                setSummary();
+            }
+        }
+
+        function sendControl(serial, data) {
+            recordAction(serial, data);
+            getControlTargetSerials(serial).forEach((targetView) => {
+                socket.emit('control_data', targetView.serial, cloneControlDataForTarget(data, targetView));
+            });
+        }
+
+        updateScriptLibraryControls();
+
+        function normalizeDeviceMetadata(metadata) {
+            return {
+                id: metadata && metadata.id ? String(metadata.id) : '',
+                name: metadata && metadata.name ? String(metadata.name) : ''
+            };
+        }
+
+        function updateDeviceTitle(view) {
+            const metadata = view.metadata || {};
+            const label = metadata.name || metadata.id || view.serial;
+            view.titleElement.textContent = metadata.name && metadata.id ? `${metadata.name} - ${metadata.id}` : label;
+            view.titleElement.title = view.serial;
+        }
+
+        function applyDeviceMetadata(view, metadata) {
+            view.metadata = normalizeDeviceMetadata(metadata);
+            view.card.dataset.FriendName = view.metadata.name;
+            view.card.dataset.friendid = view.metadata.id;
+            updateDeviceTitle(view);
+        }
+
+        function createVideoParser(view) {
+            return new VideoParser(({ type, data }) => {
+                if (type === 'nalu') {
+                    view.parserStats.nalu += 1;
+                    view.jmuxer.feed({ video: data });
+                } else if (type === 'init') {
+                    view.parserStats.init += 1;
+                    if (view.parserStats.init > 1) {
+                        view.jmuxer.reset();
+                    }
+                    view.jmuxer.feed({ video: data["sps"] });
+                    view.jmuxer.feed({ video: data["pps"] });
+                } else if (type === 'screen_size') {
+                    view.parserStats.size = `${data["width"]}x${data["height"]}`;
+                    view.card.style.setProperty('--device-ratio', `${data["width"]} / ${data["height"]}`);
+                    view.card.style.setProperty('--device-height-ratio', data["height"] / data["width"]);
+                    initInput(view, data["width"], data["height"]);
+                } else if (type === 'size_change' && view.input) {
+                    view.parserStats.size = `${data["width"]}x${data["height"]}`;
+                    view.card.style.setProperty('--device-ratio', `${data["width"]} / ${data["height"]}`);
+                    view.card.style.setProperty('--device-height-ratio', data["height"] / data["width"]);
+                    view.input.resizeScreen(data["width"], data["height"]);
+                }
+            }, false);
+        }
+
+        function ensureDevice(serial, metadata = null) {
+            if (deviceViews.has(serial)) {
+                const view = deviceViews.get(serial);
+                if (metadata) {
+                    applyDeviceMetadata(view, metadata);
+                }
+                return view;
+            }
+
+            const card = document.createElement('section');
+            card.className = 'device-card';
+            card.dataset.serial = serial;
+
+            const actions = document.createElement('div');
+            actions.className = 'actions';
+            actions.innerHTML = `
+                <div class="device-tool-row">
+                    <button class="device-reset" type="button" data-serial="${serial}" title="Reset connessione">
+                        <i class="fa-solid fa-rotate-right"></i>
+                    </button>
+                    <button class="device-reset html-capture" type="button" data-serial="${serial}" title="Scarica HTML">
+                        <i class="fa-solid fa-file-arrow-down"></i>
+                    </button>
+                </div>
+                <div class="device-actions">
+                    <select data-serial="${serial}" class="type_of_select">
+                        <option value="deposit">Deposito</option>
+                        <option value="withdrawal">Prelievo</option>
+                    </select>
+                    <select class="bookmaker-select" data-serial="${serial}">
+                    </select>
+                    <input type="text" class="event-name" id="event-name-${serial}" placeholder="Evento">
+                    <input type="number" id="input-${serial}" placeholder="Importo">
+                    <button id="send-${serial}" data-serial="${serial}" onclick="sendAccountMovement(this)">Invia</button>
+                    <select class="action-script-select" data-serial="${serial}">
+                    </select>
+                    <button class="action-script-delete" type="button" data-serial="${serial}">Elimina script</button>
+                </div>
+            `;
+
+            populateBookmakerSelect(actions.querySelector('.bookmaker-select'), null);
+            const resetButton = actions.querySelector('.device-reset');
+            const htmlCaptureButton = actions.querySelector('.html-capture');
+            const actionScriptSelect = actions.querySelector('.action-script-select');
+            const actionScriptDeleteButton = actions.querySelector('.action-script-delete');
+
+            const toolbar = document.createElement('div');
+            toolbar.className = 'device-toolbar';
+
+            const status = document.createElement('span');
+            status.className = 'status';
+
+            const title = document.createElement('div');
+            title.className = 'device-title';
+            title.textContent = serial;
+
+            const stats = document.createElement('div');
+            stats.className = 'stats';
+            stats.textContent = '0 KB/s';
+
+            const toolbarActions = document.createElement('div');
+            toolbarActions.className = 'toolbar-actions';
+
+            const menuRoot = document.createElement('div');
+            menuRoot.className = 'device-menu';
+
+            const menuPanel = document.createElement('div');
+            menuPanel.className = 'device-menu-panel';
+            menuRoot.appendChild(menuPanel);
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'video-wrapper';
+
+            const video = document.createElement('video');
+            video.id = `player-${serial.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+            video.autoplay = true;
+            video.muted = true;
+            video.playsInline = true;
+            video.controls = false;
+            video.tabIndex = 0;
+            wrapper.appendChild(video);
+
+            toolbar.appendChild(status);
+            toolbar.appendChild(title);
+            toolbar.appendChild(stats);
+            toolbar.appendChild(toolbarActions);
+            toolbar.appendChild(menuRoot);
+            card.appendChild(toolbar);
+            card.appendChild(wrapper);
+            card.appendChild(actions);
+            devicesElement.appendChild(card);
+
+            const view = {
+                card,
+                acceptVideo: false,
+                input: null,
+                jmuxer: null,
+                parser: null,
+                parserStats: {
+                    init: 0,
+                    nalu: 0,
+                    size: ''
+                },
+                receivedBytes: 0,
+                htmlCaptureButton,
+                actionScriptDeleteButton,
+                actionScriptSelect,
+                resetButton,
+                serial,
+                metadata: normalizeDeviceMetadata(metadata || {}),
+                statsElement: stats,
+                status: 'starting',
+                statusElement: status,
+                titleElement: title,
+                toolbar,
+                toolbarActions,
+                toolbarButtons: [],
+                menuPanel,
+                menuRoot,
+                video,
+                wrapper
+            };
+
+            menuRoot.insertBefore(createMenuButton(view), menuPanel);
+
+            applyDeviceMetadata(view, metadata);
+            const handleReplicatedActionTargetToggle = (event) => {
+                if (!isReplicatedActionTargetEvent(event)) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                const now = Date.now();
+                if (now - lastReplicatedTargetToggle < 80) {
+                    return;
+                }
+                lastReplicatedTargetToggle = now;
+                toggleReplicatedActionTarget(view);
+            };
+            const stopReplicatedActionTargetEvent = (event) => {
+                if (!isReplicatedActionTargetEvent(event)) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+            };
+            card.addEventListener('pointerdown', handleReplicatedActionTargetToggle, true);
+            card.addEventListener('mousedown', handleReplicatedActionTargetToggle, true);
+            card.addEventListener('pointerup', stopReplicatedActionTargetEvent, true);
+            card.addEventListener('mouseup', stopReplicatedActionTargetEvent, true);
+            card.addEventListener('click', stopReplicatedActionTargetEvent, true);
+            resetButton.addEventListener('click', () => {
+                resetDeviceView(view);
+                socket.emit('reset_device', serial);
+            });
+            htmlCaptureButton.addEventListener('click', () => {
+                htmlCaptureButton.disabled = true;
+                socket.emit('capture_html', serial);
+            });
+            actionScriptSelect.addEventListener('change', () => {
+                actionRecorder.selectedScriptNames[serial] = actionScriptSelect.value;
+                scriptNameInput.value = actionScriptSelect.value;
+                updateScriptLibraryControls();
+                updateRecorderButtons();
+                setSummary();
+            });
+            actionScriptDeleteButton.addEventListener('click', () => {
+                deleteSelectedActionScriptForView(view);
+            });
+            updateDeviceScriptControls(view);
+
+            const jmuxer = new JMuxer({
+                node: video,
+                mode: 'video',
+                flushingTime: 0,
+                fps: 30,
+                clearBuffer: true,
+                onError: (error) => {
+                    console.error(`JMuxer ${serial}`, error);
+                    view.statusElement.className = 'status failed';
+                }
+            });
+
+            view.jmuxer = jmuxer;
+            view.parser = createVideoParser(view);
+
+            deviceViews.set(serial, view);
+            socket.on(`video_data:${serial}`, (data) => {
+                if (!view.acceptVideo) {
+                    return;
+                }
+                view.receivedBytes += data.byteLength || data.length || 0;
+                view.parser.appendData(new Uint8Array(data));
+            });
+            setSummary();
+            return view;
+        }
+
+        function resetDeviceView(view) {
+            view.acceptVideo = false;
+            view.parserStats.init = 0;
+            view.parserStats.nalu = 0;
+            view.parserStats.size = '';
+            view.receivedBytes = 0;
+            view.statsElement.textContent = 'restarting';
+            view.status = 'starting';
+            view.statusElement.className = 'status starting';
+            view.resetButton.disabled = true;
+            if (view.jmuxer) {
+                view.jmuxer.reset();
+                view.parser = createVideoParser(view);
+            }
+        }
+
+        function initInput(view, width, height) {
+            if (view.input) {
+                view.input.resizeScreen(width, height);
+                updateToolbarOverflow(view);
+                return;
+            }
+
+            view.input = new ScrcpyInput(
+                (data) => sendControl(view.serial, data),
+                view.video,
+                width,
+                height,
+                false
+            );
+
+            view.recordButton = createRecorderButton(view, 'fa-solid fa-circle', 'Registra script', startActionRecording);
+            view.stopRecordButton = createRecorderButton(view, 'fa-solid fa-stop', 'Ferma registrazione', stopActionRecording);
+            view.playRecordButton = createRecorderButton(view, 'fa-solid fa-play', 'Esegui script', playActionRecording);
+            view.clearRecordButton = createRecorderButton(view, 'fa-solid fa-trash', 'Cancella script', clearActionRecording);
+
+            view.toolbarButtons = [
+                view.recordButton,
+                view.stopRecordButton,
+                view.playRecordButton,
+                view.clearRecordButton,
+                createButton('fa-solid fa-power-off', 'Power',
+                    (event) => {
+                        stopToolbarEvent(event);
+                        view.input.cancelTouch();
+                        view.input.screen_on_off(0);
+                    },
+                    (event) => {
+                        stopToolbarEvent(event);
+                        view.input.cancelTouch();
+                        view.input.screen_on_off(1);
+                    }
+                ),
+                createButton('fa-solid fa-arrow-left', 'Back',
+                    (event) => sendToolbarKey(view, event, 0, 4),
+                    (event) => sendToolbarKey(view, event, 1, 4)
+                ),
+                createButton('fa-solid fa-house', 'Home',
+                    (event) => sendToolbarKey(view, event, 0, 3),
+                    (event) => sendToolbarKey(view, event, 1, 3)
+                ),
+                createButton('fa-solid fa-volume-down', 'Volume down',
+                    (event) => sendToolbarKey(view, event, 0, 25),
+                    (event) => sendToolbarKey(view, event, 1, 25)
+                ),
+                createButton('fa-solid fa-volume-up', 'Volume up',
+                    (event) => sendToolbarKey(view, event, 0, 24),
+                    (event) => sendToolbarKey(view, event, 1, 24)
+                ),
+                createButton('fa-solid fa-bars', 'App switcher',
+                    (event) => sendToolbarKey(view, event, 0, 187),
+                    (event) => sendToolbarKey(view, event, 1, 187)
+                )
+            ];
+            updateRecorderButtons();
+            updateToolbarOverflow(view);
+        }
+
+        function setDeviceStatus(serial, state) {
+            const view = ensureDevice(serial);
+            view.status = state.status;
+            view.statusElement.className = `status ${state.status}`;
+            if (state.status === 'connected') {
+                view.parserStats.init = 0;
+                view.parserStats.nalu = 0;
+                view.receivedBytes = 0;
+                view.resetButton.disabled = false;
+                if (view.jmuxer) {
+                    view.jmuxer.reset();
+                    view.parser = createVideoParser(view);
+                }
+                view.acceptVideo = true;
+            } else if (state.status === 'starting' || state.status === 'stopped' || state.status === 'failed') {
+                view.acceptVideo = false;
+                view.resetButton.disabled = state.status === 'starting';
+            }
+            updateRecorderButtons();
+            setSummary();
+        }
+
+        socket.on('device_list', ({ selected, config, metadata }) => {
+            if (config && config.max_size) {
+                streamSizeSelect.value = String(config.max_size);
+            }
+            selected.forEach((serial) => ensureDevice(serial, metadata ? metadata[serial] : {}));
+            setSummary();
+            socket.emit('start_devices');
+        });
+
+        socket.on('stream_config', ({ max_size }) => {
+            streamSizeSelect.value = String(max_size);
+            resetDeviceViewsForRestart();
+        });
+
+        streamSizeSelect.addEventListener('change', () => {
+
+            resetDeviceViewsForRestart();
+            socket.emit('stream_config', { max_size: Number(streamSizeSelect.value) });
+        });
+
+        bookmakerChangeSelect.addEventListener('change', async () => {
+            const bookmaker = bookmakerChangeSelect.value;
+            if (!bookmaker) {
+                return;
+            }
+
+            for (const view of deviceViews.values()) {
+                const select = view.card.querySelector('.bookmaker-select');
+                if (select) {
+                    select.value = bookmaker;
+                }
+            }
+
+            try {
+                const response = await fetch('/setAllActiveBookmakerPages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        bookmaker,
+                        devices: [...deviceViews.values()].map((view) => ({
+                            serial: view.serial,
+                            friendName: view.card.dataset.FriendName || '',
+                            friendid: view.card.dataset.friendid || ''
+                        }))
+                    })
+                });
+
+                const payload = await response.json();
+                if (!response.ok) {
+                    console.error('Error setting bookmaker pages:', payload);
+                }
+            } catch (error) {
+                console.error('Error setting bookmaker pages:', error);
+            }
+        });
+
+        socket.on('device_status', (state) => {
+            setDeviceStatus(state.serial, state);
+        });
+
+        socket.on('html_capture_status', (state) => {
+            const view = deviceViews.get(state.serial);
+            if (!view) {
+                return;
+            }
+
+            if (state.status === 'running') {
+                view.htmlCaptureButton.disabled = true;
+                return;
+            }
+
+            view.htmlCaptureButton.disabled = false;
+            if (state.status === 'completed') {
+                console.log(`HTML salvato per ${state.serial}:`, state);
+                alert(`HTML salvato:\n${state.path}`);
+            } else if (state.status === 'failed') {
+                console.error(`HTML capture failed for ${state.serial}:`, state.error);
+                alert(`Errore download HTML: ${state.error}`);
+            }
+        });
+
+        socket.on('connect_error', () => {
+            summaryElement.textContent = 'Connection rejected';
+        });
+
+        setInterval(() => {
+            deviceViews.forEach((view) => {
+                view.statsElement.textContent = `${Math.round(view.receivedBytes / 1024)} KB/s i${view.parserStats.init} n${view.parserStats.nalu}`;
+                view.receivedBytes = 0;
+            });
+        }, 1000);
+
+        window.addEventListener('beforeunload', () => {
+            socket.disconnect();
+        });
+
+        window.addEventListener('resize', () => {
+            deviceViews.forEach((view) => updateToolbarOverflow(view));
+        });
+
+        document.addEventListener('pointerdown', (event) => {
+            deviceViews.forEach((view) => {
+                if (!view.menuRoot.contains(event.target)) {
+                    view.menuRoot.classList.remove('open');
+                }
+            });
+        });
+    </script>
+</body>
+
+</html>
