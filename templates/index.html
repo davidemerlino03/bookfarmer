@@ -564,6 +564,27 @@
             updateDeviceTitle(view);
         }
 
+        function isValidVideoSize(width, height) {
+            return Number.isInteger(width) &&
+                Number.isInteger(height) &&
+                width > 0 &&
+                height > 0 &&
+                width <= 10000 &&
+                height <= 10000;
+        }
+
+        function applyDeviceVideoSize(view, width, height) {
+            if (!isValidVideoSize(width, height)) {
+                console.warn('Ignoring invalid video size', width, height);
+                return false;
+            }
+
+            view.parserStats.size = `${width}x${height}`;
+            view.card.style.setProperty('--device-ratio', `${width} / ${height}`);
+            view.card.style.setProperty('--device-height-ratio', height / width);
+            return true;
+        }
+
         function createVideoParser(view) {
             return new VideoParser(({ type, data }) => {
                 if (type === 'nalu') {
@@ -577,15 +598,13 @@
                     view.jmuxer.feed({ video: data["sps"] });
                     view.jmuxer.feed({ video: data["pps"] });
                 } else if (type === 'screen_size') {
-                    view.parserStats.size = `${data["width"]}x${data["height"]}`;
-                    view.card.style.setProperty('--device-ratio', `${data["width"]} / ${data["height"]}`);
-                    view.card.style.setProperty('--device-height-ratio', data["height"] / data["width"]);
-                    initInput(view, data["width"], data["height"]);
+                    if (applyDeviceVideoSize(view, data["width"], data["height"])) {
+                        initInput(view, data["width"], data["height"]);
+                    }
                 } else if (type === 'size_change' && view.input) {
-                    view.parserStats.size = `${data["width"]}x${data["height"]}`;
-                    view.card.style.setProperty('--device-ratio', `${data["width"]} / ${data["height"]}`);
-                    view.card.style.setProperty('--device-height-ratio', data["height"] / data["width"]);
-                    view.input.resizeScreen(data["width"], data["height"]);
+                    if (applyDeviceVideoSize(view, data["width"], data["height"])) {
+                        view.input.resizeScreen(data["width"], data["height"]);
+                    }
                 }
             }, false);
         }
